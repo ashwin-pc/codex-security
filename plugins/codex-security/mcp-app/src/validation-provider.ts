@@ -1,17 +1,18 @@
-import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { mkdir, readFile } from "node:fs/promises";
 import { replaceArtifactText } from "./artifact-io.js";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
-import { readProjectConfig } from "../../../../sdk/typescript/src/project-config.js";
-import { validationProviderFromConfiguration } from "../../../../sdk/typescript/src/validation-providers.js";
+import { readSelectedProjectConfig } from "./deep-scan/project-config.js";
 import {
-  unavailableAssessment,
-  type ValidationProvider,
-  type ValidationProviderAssessment,
+  validationProviderFromConfiguration,
+  assessPluginFindings,
+  continuumAssessmentVersion,
+  savedContinuumAssessments,
+  withPublicationLock,
   type ValidationProviderConfiguration,
-  type ValidationItemRecord,
-} from "../../../../sdk/typescript/src/validation-provider.js";
+} from "#validation-runtime";
 import type { JsonObject } from "./types.js";
+import { asRecord } from "./record.js";
 import { protectedHostPathResolver } from "./helpers/inventory-git.js";
 
 /** Text accompanies structured content so every MCP client exposes the result. */
@@ -19,28 +20,10 @@ export function validationCompletionText(
   validation: JsonObject | undefined,
 ): string {
   if (!validation) return "";
-  return `\n\nSupplemental validation (${validation.provider ?? "provider"}): ${validation.status}\n${validation.summary ?? validation.report ?? validation.message ?? ""}${validation.reportPath ? `\nReport: ${validation.reportPath}` : ""}${validation.recordsPath ? `\nRecords: ${validation.recordsPath}` : ""}`;
-}
-
-function itemConclusion(record: ValidationItemRecord): string {
-  const bases = [...new Set(record.reasons.map((reason) => reason.basis))];
-  if (record.resultScope === "issue") {
-    const others =
-      record.issueFindingCount === undefined
-        ? "other findings"
-        : `${record.issueFindingCount - 1} other findings`;
-    const reachability = record.reasons.find((reason) =>
-      reason.reason.startsWith("Basis:"),
-    );
-    const exposure =
-      record.reachableFromAttacker === true
-        ? "reachable from attacker"
-        : record.reachableFromAttacker === false
-          ? "not reachable from attacker"
-          : "unknown";
-    return `Item ${record.itemId}: Codex severity ${record.severityBefore} retained. Continuum grouped this finding with ${others} into an issue. Issue-level verdict: ${record.verdict}; issue severity: ${record.providerSeverity ?? "not returned"}. Not individually validated. Issue reachability: ${exposure}.${reachability ? ` Context: ${reachability.reason}` : ""}${record.joinedValidatedIssue ? " This finding joined an issue Continuum had already validated." : ""}${bases.length ? ` Reason bases: ${bases.join(", ")}.` : ""}${record.freshness.stale ? " Evidence predates this submission." : ""}`;
-  }
-  return `Item ${record.itemId}: ${record.severityBefore} → ${record.severityAfter}. Verdict: ${record.verdict}.${record.providerSeverity ? ` Provider severity: ${record.providerSeverity}.` : ""}${bases.length ? ` Reason bases: ${bases.join(", ")}.` : ""} Claim match: ${record.claimMatch}.${record.freshness.stale ? " Evidence predates this submission." : ""}${record.unavailable ? ` Unavailable: ${record.unavailable}` : ""}`;
+  const retry = validation.retryable
+    ? `\nOn request, ${validation.status === "outdated" ? "refresh assessments" : "retry unavailable findings"} with complete_codex_security_scan and this scan ID.`
+    : "";
+  return `\n\nSupplemental validation (${validation.provider ?? "provider"}): ${validation.status}\n${validation.summary ?? validation.report ?? validation.message ?? ""}${validation.reportPath ? `\nReport: ${validation.reportPath}` : ""}${validation.recordsPath ? `\nRecords: ${validation.recordsPath}` : ""}${retry}`;
 }
 
 function configurationPath(scanId: string): string {
@@ -52,6 +35,37 @@ function configurationPath(scanId: string): string {
   );
 }
 
+/** Called after get-scan authorizes the caller's remediation claim. */
+export async function withAssignedAssessment(
+  context: JsonObject,
+): Promise<JsonObject> {
+  const scan = asRecord(context.scan);
+  if (!Array.isArray(scan?.findings)) return context;
+  // Only a protected host record can supply this field.
+  const findings = scan.findings.map(
+    ({ continuumAssessment: _ignored, ...finding }: JsonObject) => finding,
+  );
+  const finding = findings[0];
+  const action = asRecord(finding?.remediationState)?.pendingAction;
+  if (
+    findings.length === 1 &&
+    (action === "generate" || action === "verify") &&
+    typeof scan.scanId === "string" &&
+    typeof scan.targetPath === "string" &&
+    typeof finding?.occurrenceId === "string"
+  ) {
+    const saved = await savedContinuumAssessments(
+      process.env,
+      scan.scanId,
+      scan.targetPath,
+      [finding.occurrenceId],
+    );
+    const assessment = saved.get(finding.occurrenceId);
+    if (assessment) finding.continuumAssessment = assessment;
+  }
+  return { ...context, scan: { ...scan, findings } };
+}
+
 /** Bind explicitly selected host configuration, never repository-discovered settings. */
 export async function bindValidationProvider(
   scanId: string,
@@ -60,7 +74,10 @@ export async function bindValidationProvider(
   created: boolean,
 ): Promise<void> {
   if (!created || projectConfigPath === undefined) return;
-  const project = await readProjectConfig(projectConfigPath, repositoryPath);
+  const project = await readSelectedProjectConfig(
+    projectConfigPath,
+    repositoryPath,
+  );
   const configuration = project.input.scan?.validation;
   await bindValidationProviderConfiguration(scanId, configuration, created);
 }
@@ -75,16 +92,69 @@ export async function bindValidationProviderConfiguration(
   validationProviderFromConfiguration(configuration);
   const path = configurationPath(scanId);
   await mkdir(dirname(path), { recursive: true, mode: 0o700 });
-  await writeFile(path, JSON.stringify(configuration), {
-    flag: "wx",
-    mode: 0o600,
-  });
+  await replaceArtifactText(path, JSON.stringify(configuration));
 }
 
-/** Run only after the workbench has sealed the scan. Its artifacts stay unchanged. */
-export async function validateCompletedScan(
+interface SavedValidation {
+  schemaVersion?: number;
+  configuration: ValidationProviderConfiguration;
+  repositoryPath: string;
+  records: { items: JsonObject[] };
+  result: JsonObject & { report: string };
+  retry?: unknown[] | null;
+}
+
+async function readSavedValidation(
+  path: string,
+  configuration: ValidationProviderConfiguration,
+  repositoryPath: string,
+): Promise<SavedValidation | undefined> {
+  let saved: SavedValidation;
+  try {
+    saved = JSON.parse(await readFile(path, "utf8"));
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return;
+    throw error;
+  }
+  if (
+    JSON.stringify(saved.configuration) !== JSON.stringify(configuration) ||
+    saved.repositoryPath !== repositoryPath
+  ) {
+    throw new Error(
+      "Saved validation does not match this scan's provider configuration.",
+    );
+  }
+  // Legacy terminal conclusions and mixed retry lists may both attribute an
+  // issue-wide verdict to one finding. Re-evaluate the whole batch from the
+  // separate submission receipts only when completion is explicitly requested.
+  if (
+    (saved.schemaVersion !== continuumAssessmentVersion ||
+      saved.retry === undefined) &&
+    saved.result.provider === "continuum" &&
+    (saved.result.findings || saved.records.items.length)
+  ) {
+    saved.retry = [];
+    saved.result.status = "outdated";
+  }
+  return saved;
+}
+
+/** Run only after the workbench has sealed the scan. */
+export function validateCompletedScan(
   scan: JsonObject,
   resolveProvider = validationProviderFromConfiguration,
+) {
+  return completedScanValidation(scan, resolveProvider);
+}
+
+/** Read the last protected assessment without running the provider. */
+export function readCompletedValidation(scan: JsonObject) {
+  return completedScanValidation(scan);
+}
+
+async function completedScanValidation(
+  scan: JsonObject,
+  resolveProvider?: typeof validationProviderFromConfiguration,
 ): Promise<JsonObject | undefined> {
   if (typeof scan.scanId !== "string") return;
   let configuration: ValidationProviderConfiguration;
@@ -101,98 +171,79 @@ export async function validateCompletedScan(
     const repositoryPath = String(scan.targetPath);
     const reportPath = join(scanDir, "validation.md");
     const recordsPath = join(scanDir, "validation.json");
-    // Only protected host state can establish that this provider already ran.
     const cachePath = `${configurationPath(scan.scanId)}.result`;
-    let cached;
-    try {
-      cached = JSON.parse(await readFile(cachePath, "utf8"));
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+    const readSaved = () =>
+      readSavedValidation(cachePath, configuration, repositoryPath);
+    if (!resolveProvider) {
+      const saved = await readSaved();
+      if (!saved) return;
+      const { status, provider, findings, summary, retryable } = saved.result;
+      if (status === "outdated") {
+        return {
+          status,
+          provider,
+          findings,
+          retryable: true,
+          message:
+            "Complete this scan again to refresh Continuum terminal statuses and finding attribution. Findings without a saved submission receipt may be submitted again.",
+        };
+      }
+      return {
+        status,
+        provider,
+        findings,
+        summary,
+        retryable,
+        items: saved.records.items,
+      };
     }
-    if (cached) {
-      if (
-        JSON.stringify(cached.configuration) !==
-          JSON.stringify(configuration) ||
-        cached.repositoryPath !== repositoryPath
-      )
-        throw new Error(
-          "Saved validation does not match this scan's provider configuration.",
+    return await withPublicationLock(
+      dirname(cachePath),
+      scan.scanId,
+      undefined,
+      async () => {
+        let saved = await readSaved();
+        if (!saved || saved.retry) {
+          const { findings }: { findings: JsonObject[] } = JSON.parse(
+            await readFile(join(scanDir, "findings.json"), "utf8"),
+          );
+          const { providerName, status, summary, report, records, retry } =
+            await assessPluginFindings(
+              configuration,
+              findings,
+              { repositoryPath, resolveHostPaths: protectedHostPathResolver },
+              resolveProvider,
+              saved?.retry,
+            );
+          const result = {
+            status,
+            provider: providerName,
+            findings: findings.length,
+            reportPath,
+            recordsPath,
+            report,
+            summary,
+            ...(retry ? { retryable: true } : {}),
+          };
+          saved = {
+            schemaVersion: continuumAssessmentVersion,
+            configuration,
+            repositoryPath,
+            records,
+            result,
+            retry,
+          };
+          await replaceArtifactText(cachePath, JSON.stringify(saved));
+        }
+        // These model-writable files are projections, never authoritative cache input.
+        await replaceArtifactText(reportPath, saved.result.report);
+        await replaceArtifactText(
+          recordsPath,
+          JSON.stringify(saved.records, null, 2) + "\n",
         );
-      await replaceArtifactText(reportPath, cached.result.report);
-      await replaceArtifactText(
-        recordsPath,
-        JSON.stringify(cached.records, null, 2) + "\n",
-      );
-      return { ...cached.result, reportPath, recordsPath };
-    }
-    const provider: ValidationProvider = resolveProvider(configuration);
-    const { findings }: { findings: Record<string, unknown>[] } = JSON.parse(
-      await readFile(join(scanDir, "findings.json"), "utf8"),
-    );
-    const context = {
-      repositoryPath,
-      resolveHostPaths: protectedHostPathResolver,
-    };
-    const assessments: ValidationProviderAssessment[] = provider.validateBatch
-      ? await provider
-          .validateBatch(findings, context)
-          .catch((error: unknown) =>
-            findings.map(() => unavailableAssessment(provider, error)),
-          )
-      : await Promise.all(
-          findings.map(async (finding: Record<string, unknown>) => {
-            try {
-              return await provider.validate(finding, context);
-            } catch (error) {
-              return unavailableAssessment(provider, error);
-            }
-          }),
-        );
-    const summary = assessments
-      .map((assessment) =>
-        assessment.record
-          ? itemConclusion(assessment.record)
-          : assessment.report,
-      )
-      .join("\n");
-    const report = assessments
-      .map(
-        (assessment, index) =>
-          `## ${findings[index].occurrenceId ?? findings[index].id ?? `item-${index + 1}`}\n\nDisposition: ${assessment.disposition}\n\n${assessment.report}\n`,
-      )
-      .join("\n---\n\n");
-    const records = {
-      schemaVersion: 1,
-      findings: findings.length,
-      summary,
-      items: assessments.flatMap((assessment) =>
-        assessment.record ? [assessment.record] : [],
-      ),
-    };
-    const result = {
-      status: "complete",
-      provider: provider.name,
-      findings: findings.length,
-      reportPath,
-      recordsPath,
-      report,
-      summary,
-    };
-    await writeFile(
-      cachePath,
-      JSON.stringify({ configuration, repositoryPath, records, result }),
-      {
-        flag: "wx",
-        mode: 0o600,
+        return { ...saved.result, reportPath, recordsPath };
       },
     );
-    // These model-writable files are projections, never authoritative cache input.
-    await replaceArtifactText(reportPath, report);
-    await replaceArtifactText(
-      recordsPath,
-      JSON.stringify(records, null, 2) + "\n",
-    );
-    return result;
   } catch (error) {
     // An unavailable supplemental provider must not turn a sealed scan into a failure.
     return {

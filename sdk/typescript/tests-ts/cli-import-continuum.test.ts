@@ -654,6 +654,7 @@ test("a bundled validation artifact includes only the selected finding's proof a
   };
   const selectedBody = {
     validationEvidence: {
+      terminalStatus: validation.terminalStatus,
       exploitable: selected.exploitable,
       perFindingResults: [selected],
     },
@@ -681,6 +682,62 @@ test("a bundled validation artifact includes only the selected finding's proof a
     patches: [patch],
     evidenceArtifacts: [{ ...artifact, body: selectedBody }],
   });
+});
+
+test("conflicting results retain only the verified issue verdict in live and saved captures", async () => {
+  const descriptor = continuumValidationArtifact();
+  const artifacts = [
+    {
+      ...descriptor,
+      body: {
+        validationEvidence: {
+          exploitable: "UNCERTAIN",
+          terminalStatus: "FAILED",
+          sourceAnalysis: { summary: "Bundled analysis" },
+          perFindingResults: [
+            { findingId: "one", exploitable: "EXPLOITABLE" },
+            { findingId: "one", exploitable: "NOT_EXPLOITABLE" },
+          ],
+        },
+      },
+    },
+  ];
+  const { finding, issue, capture } = await collectSelectedArtifacts(
+    ["one"],
+    artifacts,
+  );
+  const validationIssue = {
+    issueArn: issue.issueArn,
+    issueId: issue.issueId,
+    findingIds: ["one"],
+  };
+  expect(capture).toEqual({
+    finding,
+    validationIssue,
+    evidenceArtifacts: [
+      {
+        ...descriptor,
+        body: {
+          validationEvidence: {
+            exploitable: "UNCERTAIN",
+            terminalStatus: "FAILED",
+          },
+        },
+      },
+    ],
+  });
+  expect(
+    normalizeContinuumFindings(
+      { finding, validationIssue, evidenceArtifacts: artifacts },
+      continuumRepository,
+    ),
+  ).toEqual(normalizeContinuumFindings(capture, continuumRepository));
+  expect(
+    normalizeContinuumFindings(
+      { finding, evidenceArtifacts: artifacts },
+      continuumRepository,
+    ),
+  ).toEqual(normalizeContinuumFindings(finding, continuumRepository));
 });
 
 test.each([
@@ -726,6 +783,19 @@ test.each([
           }
         : finding,
     );
+    if (matches) {
+      const { findings } = normalizeContinuumFindings(
+        capture,
+        continuumRepository,
+      );
+      expect(findings[0]?.evidence).toMatchObject({
+        details: { scanner_verdict: finding.validation.verdict },
+        source_data: {
+          validation_issue: { issueArn: issue.issueArn },
+          evidence_artifacts: artifacts,
+        },
+      });
+    }
     expect(
       aws.mock.calls.filter(([args]) => args[1] === "get-code-issue"),
     ).toHaveLength(1);

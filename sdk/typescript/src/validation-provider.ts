@@ -5,7 +5,7 @@ export interface ValidationProvenance {
   providerVersion: string;
   referenceId?: string;
   referenceUrl?: string;
-  validatedAt: string;
+  validatedAt?: string;
 }
 
 /** Known provenance categories, or a future category preserved as reported. */
@@ -18,15 +18,33 @@ export type ValidationClaimMatch =
 /** Conclusions only. Proof bodies and console output are not report fields. */
 export interface ValidationItemRecord {
   itemId: string;
+  /** External identities for an accepted submission, including while validation is pending. */
+  findingId?: string;
+  findingArn?: string;
+  issueId?: string;
+  issueArn?: string;
+  validationArtifactId?: string;
+  scoringArtifactId?: string;
+  /** Selected provider conclusion for a matched, current finding. */
+  proofObservation?: {
+    kind: "execution" | "source_analysis";
+    effect?: string;
+    summary?: string;
+  };
+  submittedAt?: string;
   provider: string;
   verdict: string;
+  /** How the external validation run ended, independently of its verdict. */
+  terminalStatus?: string;
+  /** Provider explanation when it declined the submission. */
+  statusMessage?: string;
   severityBefore: string;
   severityAfter: string;
   providerSeverity?: string;
-  /** Scope of the verdict and provider severity, not the sealed Codex finding. */
+  /** Scope of the provider verdict. */
   resultScope?: ValidationResultScope;
   issueFindingCount?: number;
-  /** Structured attacker reachability at resultScope; absent means unknown. */
+  /** Structured attacker reachability from the provider's scoring evidence. */
   reachableFromAttacker?: boolean;
   /** Issue validation evidence existed before this finding was submitted. */
   joinedValidatedIssue?: boolean;
@@ -34,6 +52,8 @@ export interface ValidationItemRecord {
   claimMatch: ValidationClaimMatch;
   issueUrl?: string;
   freshness: {
+    /** Creation time of the returned validation artifact, including inconclusive results. */
+    evidenceCreatedAt?: string;
     validatedAt?: string;
     stale: boolean;
     reasons: string[];
@@ -81,6 +101,16 @@ export type ValidationProviderConfiguration = {
   [provider: string]: unknown;
 };
 
+export function supplementalValidationStatus(
+  provider: ValidationProvider | undefined,
+  assessments: readonly ValidationProviderAssessment[] | undefined,
+): "complete" | "incomplete" {
+  return provider?.name === "continuum" &&
+    assessments?.some((item) => item.disposition === "deferred")
+    ? "incomplete"
+    : "complete";
+}
+
 export function unavailableAssessment(
   provider: Pick<ValidationProvider, "name" | "version">,
   reason: unknown,
@@ -95,7 +125,6 @@ export function unavailableAssessment(
     provenance: {
       provider: provider.name,
       providerVersion: provider.version,
-      validatedAt: new Date().toISOString(),
     },
     report: `Unavailable: ${message}`,
   };
